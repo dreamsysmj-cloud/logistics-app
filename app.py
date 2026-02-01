@@ -1,116 +1,169 @@
 import streamlit as st
 import pandas as pd
 
-# 페이지 설정 (넓은 화면 사용)
-st.set_page_config(page_title="물류 재고 통합 시스템", layout="wide")
+# 페이지 설정
+st.set_page_config(page_title="물류 통합 대시보드", layout="wide")
 
-# 제목 및 헤더 디자인
-st.title("📦 물류 재고 통합 대시보드")
-st.markdown("---")
+st.title("📦 물류 재고 & 매출 통합 현황판")
+st.markdown("엑셀 파일(재고, 판매)을 드래그해서 넣으세요. 제목 줄이 있어도 알아서 처리합니다.")
 
-# 사이드바 (파일 업로드 창을 왼쪽으로 뺌)
+# 사이드바: 파일 업로드
 with st.sidebar:
-    st.header("📂 데이터 업로드")
+    st.header("📂 엑셀 파일 업로드")
     uploaded_files = st.file_uploader(
-        "엑셀 파일들을 모두 드래그하세요", 
+        "파일을 모두 이곳에 드래그하세요", 
         accept_multiple_files=True, 
-        type=['xlsx', 'csv']
+        type=['xlsx', 'xls', 'csv']
     )
-    st.info("💡 팁: 여러 파일을 한꺼번에 선택해서 놓으세요.")
+    st.info("💡 재고 파일과 판매 파일을 섞어서 올려도 됩니다.")
 
+# ---------------------------------------------------------
+# 함수: 엑셀에서 '진짜 헤더(품목코드)'가 있는 줄 찾기
+# ---------------------------------------------------------
+def load_excel_smartly(file):
+    try:
+        # 일단 앞부분 10줄만 읽어봅니다.
+        df_preview = pd.read_excel(file, header=None, nrows=10)
+        
+        # '품목코드' 또는 '코드'라는 글자가 있는 행(Row)을 찾습니다.
+        target_row = -1
+        for idx, row in df_preview.iterrows():
+            row_str = row.astype(str).values
+            if any("품목코드" in s or "코드" in s for s in row_str):
+                target_row = idx
+                break
+        
+        if target_row == -1:
+            return None, "표 머리글(품목코드)을 찾을 수 없음"
+
+        # 진짜 헤더 위치를 알았으니 다시 제대로 읽습니다.
+        df = pd.read_excel(file, header=target_row)
+        return df, None
+        
+    except Exception as e:
+        return None, str(e)
+
+# ---------------------------------------------------------
+# 메인 로직
+# ---------------------------------------------------------
 if uploaded_files:
-    # 데이터 처리 로직
-    all_data = []
+    stock_list = [] # 재고 데이터 담을 곳
+    sales_list = [] # 판매 데이터 담을 곳
     
+    # 1. 파일 읽기 및 분류
     for file in uploaded_files:
-        try:
-            df = pd.read_excel(file)
+        # 파일명으로 업체명 추측
+        filename = file.name
+        company = "기타"
+        if "하은" in filename: company = "하은"
+        elif "한국" in filename: company = "한국"
+        elif "가온" in filename: company = "가온"
+        elif "다이소" in filename: company = "다이소"
+        
+        # 스마트하게 엑셀 읽기
+        df, error_msg = load_excel_smartly(file)
+        
+        if df is None:
+            st.error(f"❌ {filename} 읽기 실패: {error_msg}")
+            continue
+
+        # 필요한 컬럼 찾기 (유연하게)
+        cols = df.columns.astype(str)
+        col_code = next((c for c in cols if "코드" in c), None)
+        col_name = next((c for c in cols if "품명" in c or "규격" in c or "품목" in c), None)
+        col_qty = next((c for c in cols if "수량" in c or "재고" in c), None)
+        
+        # 데이터 정제
+        if col_code and col_qty:
+            clean_df = df.copy()
+            # 컬럼 이름 통일
+            rename_map = {col_code: '품목코드', col_qty: '수량'}
+            if col_name:
+                rename_map[col_name] = '품목명'
+            else:
+                clean_df['품목명'] = '이름없음' # 품명 없으면 임시로 채움
             
-            # 업체명 추측 (파일명 기반)
-            filename = file.name
-            company_name = "기타"
-            if "하은" in filename: company_name = "하은"
-            elif "한국" in filename: company_name = "한국"
-            elif "가온" in filename: company_name = "가온"
-            elif "다이소" in filename: company_name = "다이소"
+            clean_df = clean_df.rename(columns=rename_map)
+            clean_df['업체'] = company
             
-            # 컬럼 찾기 (유연하게)
-            col_code = [c for c in df.columns if "코드" in c][0]
-            col_name = [c for c in df.columns if "품명" in c or "규격" in c][0]
-            col_qty = [c for c in df.columns if "수량" in c or "재고" in c][0]
+            # 수량 숫자로 변환 (공백 제거 등)
+            clean_df['수량'] = pd.to_numeric(clean_df['수량'], errors='coerce').fillna(0)
+
+            # 파일명에 '판매'나 '매출'이 있으면 판매 리스트로, 아니면 재고로
+            if "판매" in filename or "매출" in filename:
+                sales_list.append(clean_df[['품목코드', '품목명', '수량', '업체']])
+            else:
+                stock_list.append(clean_df[['품목코드', '품목명', '수량', '업체']])
+        else:
+            st.warning(f"⚠️ {filename}: '코드'나 '수량' 칸을 못 찾아서 건너뜁니다.")
+
+    # ---------------------------------------------------------
+    # 2. 대시보드 화면 그리기
+    # ---------------------------------------------------------
+    
+    # 탭으로 재고와 판매를 나눠서 보여줌
+    tab1, tab2 = st.tabs(["📦 재고 현황", "💰 판매(매출) 현황"])
+
+    # [탭 1] 재고 현황
+    with tab1:
+        if stock_list:
+            df_stock = pd.concat(stock_list)
             
-            # 필요한 데이터만 추출
-            df_clean = df[[col_code, col_name, col_qty]].copy()
-            df_clean.columns = ['품목코드', '품목명', '수량']
-            df_clean['업체'] = company_name
+            # 피벗 테이블 (업체별 가로 정렬)
+            pivot_stock = df_stock.pivot_table(
+                index=['품목코드', '품목명'], columns='업체', values='수량', aggfunc='sum', fill_value=0
+            ).reset_index()
             
-            all_data.append(df_clean)
+            # 총계 계산
+            num_cols = [c for c in pivot_stock.columns if c not in ['품목코드', '품목명']]
+            pivot_stock['총재고'] = pivot_stock[num_cols].sum(axis=1)
+
+            # 상단 지표
+            c1, c2, c3 = st.columns(3)
+            c1.metric("총 품목 수", f"{len(pivot_stock)} 개")
+            c2.metric("총 재고 수량", f"{pivot_stock['총재고'].sum():,.0f} 개")
+            c3.metric("최다 보유 업체", pivot_stock[num_cols].sum().idxmax())
             
-        except Exception as e:
-            st.error(f"❌ {file.name} 읽기 실패: {e}")
+            st.divider()
+            
+            # 그래프와 표
+            col_chart, col_table = st.columns([1, 2])
+            with col_chart:
+                st.subheader("업체별 재고 비중")
+                st.bar_chart(pivot_stock[num_cols].sum(), color="#FF4B4B")
+            with col_table:
+                st.subheader("상세 재고표")
+                st.dataframe(pivot_stock, use_container_width=True, height=400, hide_index=True)
+        else:
+            st.info("재고 파일이 아직 업로드되지 않았습니다.")
 
-    # 데이터 통합 및 대시보드 표시
-    if all_data:
-        merged_df = pd.concat(all_data)
-        
-        # 피벗 테이블 (업체별 가로 정렬)
-        final_df = merged_df.pivot_table(
-            index=['품목코드', '품목명'], 
-            columns='업체', 
-            values='수량', 
-            aggfunc='sum', 
-            fill_value=0
-        ).reset_index()
-        
-        # 총 합계 계산
-        numeric_cols = [c for c in final_df.columns if c not in ['품목코드', '품목명']]
-        final_df['총재고'] = final_df[numeric_cols].sum(axis=1)
-        
-        # --------------------
-        # 📊 대시보드 화면 시작
-        # --------------------
-        
-        # 1. 핵심 지표 (Metrics) - 맨 위에 큰 숫자로 보여줌
-        total_items = len(final_df)
-        total_qty = final_df['총재고'].sum()
-        top_product = final_df.sort_values(by='총재고', ascending=False).iloc[0]['품목명']
+    # [탭 2] 판매 현황
+    with tab2:
+        if sales_list:
+            df_sales = pd.concat(sales_list)
+            
+            # 피벗 테이블
+            pivot_sales = df_sales.pivot_table(
+                index=['품목코드', '품목명'], columns='업체', values='수량', aggfunc='sum', fill_value=0
+            ).reset_index()
+            
+            pivot_sales['총판매량'] = pivot_sales[[c for c in pivot_sales.columns if c not in ['품목코드', '품목명']]].sum(axis=1)
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("📦 전체 품목 수", f"{total_items} 개")
-        col2.metric("📊 총 재고 수량", f"{total_qty:,.0f} 개")
-        col3.metric("🏆 최다 보유 품목", top_product)
-        
-        st.markdown("---")
-
-        # 2. 그래프 영역 (업체별 재고 비교)
-        col_chart1, col_chart2 = st.columns([1, 1]) # 화면을 반반 나눔
-        
-        with col_chart1:
-            st.subheader("🏭 업체별 재고 점유율")
-            # 업체별 총 수량 계산
-            company_sums = final_df[numeric_cols].sum()
-            st.bar_chart(company_sums, color="#FF4B4B") # 빨간색 그래프
-
-        with col_chart2:
-            st.subheader("🥇 재고 많은 품목 TOP 5")
-            # 재고 많은 순서대로 5개만 자르기
-            top_5 = final_df[['품목명', '총재고']].sort_values(by='총재고', ascending=False).head(5)
-            top_5 = top_5.set_index('품목명') # 그래프 축 설정을 위해 인덱스 변경
-            st.bar_chart(top_5, color="#1E90FF") # 파란색 그래프
-
-        st.markdown("---")
-
-        # 3. 상세 데이터 표
-        st.subheader("📋 상세 재고 현황표")
-        st.dataframe(
-            final_df, 
-            use_container_width=True, 
-            height=500,
-            hide_index=True
-        )
-
-    else:
-        st.warning("데이터가 없습니다. 엑셀 파일을 업로드해주세요.")
+            # 상단 지표
+            k1, k2 = st.columns(2)
+            k1.metric("총 판매 건수", f"{len(df_sales):,.0f} 건")
+            k2.metric("총 판매 수량", f"{pivot_sales['총판매량'].sum():,.0f} 개")
+            
+            st.divider()
+            
+            st.subheader("🏆 많이 팔린 상품 TOP 5")
+            top_sales = pivot_sales.sort_values(by='총판매량', ascending=False).head(5)
+            st.bar_chart(top_sales.set_index('품목명')['총판매량'], color="#1E90FF")
+            
+            st.subheader("상세 판매 내역")
+            st.dataframe(pivot_sales, use_container_width=True, hide_index=True)
+        else:
+            st.info("판매(매출) 파일이 아직 업로드되지 않았습니다.")
 
 else:
-    st.info("👈 왼쪽 사이드바에서 엑셀 파일을 업로드하면 대시보드가 나타납니다.")
+    st.info("👈 왼쪽 사이드바에 엑셀 파일들을 드래그해서 넣어주세요.")
