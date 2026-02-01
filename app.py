@@ -19,7 +19,7 @@ with st.sidebar:
     st.info("💡 재고 파일과 판매 파일을 섞어서 올려도 됩니다.")
 
 # ---------------------------------------------------------
-# 함수: 엑셀에서 '진짜 헤더' 위치를 점수로 찾기 (가장 중요!)
+# 함수: 엑셀에서 '진짜 헤더' 위치를 점수로 찾기 (개선됨)
 # ---------------------------------------------------------
 def find_header_and_load(file):
     try:
@@ -32,26 +32,39 @@ def find_header_and_load(file):
         # 우리가 찾는 핵심 단어들
         code_keywords = ["품목코드", "코드", "바코드", "내부코드", "상품코드"]
         name_keywords = ["품명", "상품명", "규격", "상품명 및 규격"]
-        qty_keywords = ["수량", "재고", "가용재고", "장부재고", "출고", "매출", "출고(E)", "주문수량"]
+        # '출고 (E)' 처럼 괄호가 있는 경우도 찾기 위해 키워드 보강
+        qty_keywords = ["수량", "재고", "가용재고", "장부재고", "출고", "매출", "출고(E)", "출고 (E)", "주문수량"]
 
         # 2. 각 줄을 검사해서 점수를 매깁니다.
         for idx, row in df_preview.iterrows():
-            row_str = row.astype(str).values
+            row_str_list = row.astype(str).values
             score = 0
             
-            # 해당 줄에 '코드' 관련 단어가 있으면 1점 추가
-            if any(k in s for s in row_str for k in code_keywords): score += 1
-            # 해당 줄에 '품명' 관련 단어가 있으면 1점 추가
-            if any(k in s for s in row_str for k in name_keywords): score += 1
-            # 해당 줄에 '수량' 관련 단어가 있으면 1점 추가
-            if any(k in s for s in row_str for k in qty_keywords): score += 1
+            # 특수문자 '▶'로 시작하는 줄은 메타데이터이므로 무시 (가온 파일 해결책)
+            if str(row_str_list[0]).strip().startswith("▶"):
+                continue
+
+            # 셀 하나하나를 검사
+            for cell in row_str_list:
+                cell_text = str(cell)
+                
+                # '코드' 관련 단어가 있으면 1점
+                if any(k in cell_text for k in code_keywords): score += 1
+                
+                # '품명' 관련 단어가 있으면 1점
+                if any(k in cell_text for k in name_keywords): score += 1
+                
+                # '수량' 관련 단어가 있으면 1점 (단, '일자', '금액' 등은 제외)
+                if any(k in cell_text for k in qty_keywords):
+                    if "일자" not in cell_text and "금액" not in cell_text and "단가" not in cell_text:
+                        score += 1
             
-            # 점수가 가장 높은 줄을 기억합니다 (진짜 헤더일 확률이 높음)
+            # 점수가 가장 높은 줄을 기억합니다
             if score > max_score:
                 max_score = score
                 best_row_idx = idx
         
-        # 3. 점수가 0점이면 표를 못 찾은 것
+        # 3. 점수가 0점이거나 못 찾았으면
         if max_score == 0 or best_row_idx == -1:
             return None, "표의 머리글(코드, 수량 등)을 찾지 못했습니다."
 
@@ -89,8 +102,9 @@ if uploaded_files:
         elif "한국" in filename: company = "한국"
         elif "가온" in filename: company = "가온"
         elif "다이소" in filename: company = "다이소"
+        elif "이마트" in filename: company = "이마트" # 이마트 추가
         
-        # 1. 스마트하게 엑셀 읽기 (점수 기반)
+        # 1. 스마트하게 엑셀 읽기
         df, error_msg = find_header_and_load(file)
         
         if df is None:
@@ -100,18 +114,18 @@ if uploaded_files:
         # 2. 컬럼 매칭 (번역)
         cols = df.columns
         
-        # 품목코드 찾기 (우선순위: 바코드 > 품목코드 > 내부코드)
+        # 품목코드 찾기
         col_code = find_column_name(cols, ['바코드', '품목코드', '상품코드', '내부코드', 'Code'])
         
         # 품목명 찾기
         col_name = find_column_name(cols, ['상품명 및 규격', '품목명', '품명', '상품명', '규격'])
         
-        # 수량 찾기 (가온의 '출고(E)', '가용재고' 등을 찾기 위함)
-        # 주의: '출고일자', '재고금액' 같은 건 피해야 함
-        qty_candidates = ['가용재고', '출고(E)', '재고수량', '수량', '총재고', '출고수량', '매출수량']
+        # 수량 찾기 (가온 판매의 '출고 (E)' 포함)
+        qty_candidates = ['가용재고', '출고(E)', '출고 (E)', '재고수량', '수량', '총재고', '출고수량', '매출수량', '출고']
         col_qty = None
         for key in qty_candidates:
-            found = next((c for c in cols if key in str(c) and "일자" not in str(c) and "금액" not in str(c) and "단가" not in str(c)), None)
+            # '일자', '금액', '단가', '오류' 등이 포함된 컬럼은 제외
+            found = next((c for c in cols if key in str(c) and "일자" not in str(c) and "금액" not in str(c) and "단가" not in str(c) and "오류" not in str(c)), None)
             if found:
                 col_qty = found
                 break
@@ -125,24 +139,21 @@ if uploaded_files:
             if col_name:
                 rename_map[col_name] = '품목명'
             else:
-                clean_df['품목명'] = '이름없음' # 품명 없으면 임시로 채움
+                clean_df['품목명'] = '이름없음'
             
             clean_df = clean_df.rename(columns=rename_map)
             clean_df['업체'] = company
             
-            # 수량 숫자로 변환 (콤마 제거, 문자 제거)
+            # 수량 숫자로 변환 (콤마 제거)
             clean_df['수량'] = pd.to_numeric(clean_df['수량'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
 
-            # 0보다 큰 수량만 가져올지 여부는 선택사항 (여기선 다 가져옴)
-            
-            # 파일명에 '판매'나 '매출'이 있으면 판매 리스트로, 아니면 재고로 분류
+            # 파일명에 '판매'나 '매출'이 있으면 판매 리스트로
             if "판매" in filename or "매출" in filename:
                 sales_list.append(clean_df[['품목코드', '품목명', '수량', '업체']])
             else:
                 stock_list.append(clean_df[['품목코드', '품목명', '수량', '업체']])
         else:
-            # 디버깅을 위해 찾은 컬럼들을 보여줌
-            st.warning(f"⚠️ {filename}: 핵심 칸을 못 찾았습니다. (찾은 헤더: {list(cols)})")
+            st.warning(f"⚠️ {filename}: 핵심 칸을 못 찾았습니다. (확인된 헤더: {list(cols)[:5]}...)")
 
     # ---------------------------------------------------------
     # 대시보드 화면 그리기
@@ -155,7 +166,7 @@ if uploaded_files:
         if stock_list:
             df_stock = pd.concat(stock_list)
             
-            # 피벗 테이블 (업체별 가로 정렬)
+            # 피벗 테이블
             pivot_stock = df_stock.pivot_table(
                 index=['품목코드', '품목명'], columns='업체', values='수량', aggfunc='sum', fill_value=0
             ).reset_index()
@@ -172,7 +183,6 @@ if uploaded_files:
             
             st.divider()
             
-            # 그래프와 표
             col_chart, col_table = st.columns([1, 2])
             with col_chart:
                 st.subheader("업체별 재고 비중")
@@ -181,7 +191,7 @@ if uploaded_files:
                 st.subheader("상세 재고표")
                 st.dataframe(pivot_stock, use_container_width=True, height=500, hide_index=True)
         else:
-            st.info("데이터가 없습니다.")
+            st.info("재고 데이터를 업로드해주세요.")
 
     # [탭 2] 판매 현황
     with tab2:
